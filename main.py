@@ -27,7 +27,6 @@ from src.auth import interactive_login, storage_state_exists
 from src.crawler import XianyuCrawler
 from src.login_reminder import mark_login_reminder_sent, should_send_login_reminder
 from src.notifier import EmailNotifier
-from src.session_probe import probe_storage_state_usable
 from src.storage import SeenItemStore
 
 
@@ -84,20 +83,25 @@ async def _run_one_cycle(cfg: AppConfig, store: SeenItemStore, notifier: EmailNo
         await _notify_login_required_if_allowed(cfg, notifier, msg)
         return
 
-    ok, probe_msg = await probe_storage_state_usable(
-        STORAGE_STATE_PATH, headless=cfg.headless, keyword=cfg.keyword
+    crawler = XianyuCrawler(
+        STORAGE_STATE_PATH,
+        headless=cfg.headless,
+        fetch_detail_cover_image=cfg.fetch_detail_cover_image,
     )
-    if not ok:
-        logger.error("登录态探测未通过：{}", probe_msg)
-        await _notify_login_required_if_allowed(cfg, notifier, probe_msg)
-        return
-
-    crawler = XianyuCrawler(STORAGE_STATE_PATH, headless=cfg.headless)
     try:
-        items = await crawler.fetch_latest(cfg.keyword, cfg.page_limit)
+        fetch_result = await crawler.fetch_with_result(cfg.keyword, cfg.page_limit)
     except Exception as exc:
         logger.error("抓取失败：{}\n{}", exc, traceback.format_exc())
         return
+
+    if not fetch_result.session_ok:
+        logger.error("登录态或搜索不可用：{}", fetch_result.session_message)
+        await _notify_login_required_if_allowed(
+            cfg, notifier, fetch_result.session_message
+        )
+        return
+
+    items = fetch_result.items
 
     if not items:
         logger.warning("本轮未抓到任何商品，跳过。")
@@ -134,6 +138,14 @@ async def _run_one_cycle(cfg: AppConfig, store: SeenItemStore, notifier: EmailNo
         len(to_mail),
         f"，余 {len(rest_new)} 条已写入库（notified=0）、下轮继续推送" if rest_new else "",
     )
+    if cfg.fetch_detail_cover_image and to_mail:
+        try:
+            await crawler.enrich_detail_covers(to_mail)
+        except Exception as exc:
+            logger.warning(
+                "发信前详情主图拉取失败，邮件中将使用搜索列表中的图片链接: {}",
+                exc,
+            )
     try:
         notifier.send_new_items(
             cfg.keyword,

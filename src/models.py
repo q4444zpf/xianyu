@@ -16,6 +16,8 @@ class Item:
     location: str = ""
     publish_text: str = ""
     image_url: str = ""
+    # 详情页商品主轮播大图（仅当前商品，不含推荐位）；发信前拉取；邮件可展示多张
+    gallery_urls: list[str] = field(default_factory=list)
     detail_url: str = ""
     seller: str = ""
     fetched_at: datetime = field(default_factory=datetime.now)

@@ -14,7 +14,7 @@
 
 - **必须先完成 `python main.py login`**：`data/storage_state.json` 中若没有任何 cookie（例如空模板文件），程序会视为未登录并拒绝抓取；未登录时搜索接口常返回「被挤爆」类错误，列表也为空。
 - 抓取使用 **1920×1080** 视口并在打开搜索页后等待 **networkidle**，确保闲鱼 SPA 能发起 `h5api.m.goofish.com` 上的 PC 搜索请求。
-- **`once` / `run` 每轮抓取前**会先探测登录态（能否正常走搜索接口）；若无效或文件无 cookie，会**跳过抓取**并（在冷却时间内最多发一次）向 `MAIL_TO` 发送**「需重新登录」**提醒邮件，避免因 cookie 过期长期静默抓空。
+- **`once` / `run` 每轮只启动一次浏览器**：打开搜索页后点「新发布」→「最新」再解析；同一回合内**不再单独开第二遍搜索页**做登录探测。若接口/页面判定登录态无效，会**跳过入库与商品邮件**并（在冷却时间内最多发一次）向 `MAIL_TO` 发送**「需重新登录」**提醒邮件。
 
 环境变量 **`LOGIN_REMINDER_COOLDOWN_SECONDS`**（默认 21600，即 6 小时）控制同一类提醒的最小间隔；设为 `0` 则每次失败都发邮件。
 
@@ -31,7 +31,7 @@ xianyu/
 ├── src/
 │   ├── auth.py             # 扫码登录 + 保存 storage_state
 │   ├── crawler.py          # Playwright 抓取
-│   ├── session_probe.py    # 抓取前探测登录态是否可用
+│   ├── session_probe.py    # 兼容接口：内部委托 fetch_with_result（不单开浏览器）
 │   ├── login_reminder.py   # 登录提醒邮件冷却
 │   ├── storage.py          # SQLite 去重
 │   ├── notifier.py         # SMTP 发送邮件

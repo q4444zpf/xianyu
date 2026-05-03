@@ -61,6 +61,9 @@ class AppConfig:
     # 单封商品推送邮件中最多包含的新增条数（超出部分留待后续轮次发送）
     email_max_items: int
 
+    # 是否在「确认本封邮件要推送」后，再打开详情页仅通过点击缩略图拉主图（无接口兜底；不发邮件则不开详情页）
+    fetch_detail_cover_image: bool
+
     def validate_for_mail(self) -> None:
         """运行抓取/发送前校验邮件相关配置。"""
         missing = []
@@ -105,4 +108,5 @@ def load_config() -> AppConfig:
             0, _get_int("LOGIN_REMINDER_COOLDOWN_SECONDS", 21600)
         ),
         email_max_items=max(1, _get_int("EMAIL_MAX_ITEMS", 30)),
+        fetch_detail_cover_image=_get_bool("FETCH_DETAIL_COVER_IMAGE", True),
     )

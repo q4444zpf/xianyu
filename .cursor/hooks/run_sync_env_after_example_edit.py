@@ -8,6 +8,17 @@ import sys
 from pathlib import Path
 
 
+def _resolve_project_root(data: dict, path: Path) -> Path | None:
+    """从 workspace_roots 或从已保存文件路径向上查找含 sync 脚本的项目根。"""
+    roots = data.get("workspace_roots") or []
+    if roots:
+        return Path(roots[0])
+    for p in path.parents:
+        if (p / "scripts" / "sync_env_from_example.py").is_file():
+            return p
+    return None
+
+
 def main() -> int:
     try:
         data = json.load(sys.stdin)
@@ -16,18 +27,20 @@ def main() -> int:
 
     fp = data.get("file_path") or ""
     path = Path(fp)
+    roots = data.get("workspace_roots") or []
+    if roots and not path.is_absolute():
+        path = Path(roots[0]) / path
+    try:
+        path = path.resolve()
+    except OSError:
+        return 0
+
     if path.name != ".env.example":
         return 0
 
-    roots = data.get("workspace_roots") or []
-    if roots:
-        root = Path(roots[0])
-        if not path.is_absolute():
-            path = root / path
-    else:
-        root = path.resolve().parent
-
-    if path.name != ".env.example":
+    root = _resolve_project_root(data, path)
+    if root is None:
+        print("[sync-env-hook] 无法解析项目根目录（缺少 workspace_roots）", file=sys.stderr)
         return 0
 
     script = root / "scripts" / "sync_env_from_example.py"

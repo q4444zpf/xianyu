@@ -3,8 +3,12 @@
   "hooks": {
     "afterFileEdit": [
       {
-        "command": "python .cursor/hooks/run_sync_env_after_example_edit.py",
-        "matcher": "\\.env\\.example$"
+        "command": "python .cursor/hooks/run_sync_env_after_example_edit.py"
+      }
+    ],
+    "afterTabFileEdit": [
+      {
+        "command": "python .cursor/hooks/run_sync_env_after_example_edit.py"
       }
     ]
   }
