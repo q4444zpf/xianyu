@@ -24,7 +24,7 @@ from config import (
     load_config,
 )
 from src.auth import interactive_login, storage_state_exists
-from src.crawler import XianyuCrawler
+from src.crawler import DetailValidationRequired, XianyuCrawler
 from src.login_reminder import mark_login_reminder_sent, should_send_login_reminder
 from src.notifier import EmailNotifier
 from src.storage import SeenItemStore
@@ -141,6 +141,16 @@ async def _run_one_cycle(cfg: AppConfig, store: SeenItemStore, notifier: EmailNo
     if cfg.fetch_detail_cover_image and to_mail:
         try:
             await crawler.enrich_detail_covers(to_mail)
+        except DetailValidationRequired as exc:
+            msg = (
+                f"{exc}\n"
+                "请以可视浏览器运行并手动完成验证后重试：\n"
+                "1) 设置 HEADLESS=false\n"
+                "2) 执行 python main.py once"
+            )
+            logger.warning(msg)
+            await _notify_login_required_if_allowed(cfg, notifier, msg)
+            return
         except Exception as exc:
             logger.warning(
                 "发信前详情主图拉取失败，邮件中将使用搜索列表中的图片链接: {}",

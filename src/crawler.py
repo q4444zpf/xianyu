@@ -119,6 +119,10 @@ class FetchResult:
     session_message: str = ""
 
 
+class DetailValidationRequired(RuntimeError):
+    """详情接口触发风控验证，需要人工完成后再继续。"""
+
+
 # 阿里 CDN 上常见的「列表/卡片缩略」尾缀，去掉后一般为原图或更大尺寸 key
 _ALI_RESIZE_TAIL = re.compile(
     r"_\d+x\d+(?:[qQ]\d+)?\.(?:jpg|jpeg|png)(?:_\.webp)?$",
@@ -1115,59 +1119,6 @@ async def _extract_item_code_from_page_dom(page: Page) -> str:
     return m.group(1).strip() if m else ""
 
 
-async def _extract_official_app_qr_data_url(page: Page) -> str:
-    """点击详情页右侧 APP/商品码入口，提取官方扫码弹层里的二维码 data URL。"""
-    # 入口文案在不同页面/AB 实验里可能是 APP 或 商品码。
-    entry = page.get_by_text("APP", exact=True)
-    if await entry.count() == 0:
-        entry = page.get_by_text("商品码", exact=True)
-    if await entry.count() == 0:
-        return ""
-    try:
-        await entry.first.hover(timeout=3000)
-    except Exception:
-        pass
-    try:
-        await entry.first.click(timeout=3000)
-    except Exception:
-        # 有些页面仅 hover 出弹层，不要求 click 成功。
-        pass
-    await asyncio.sleep(0.9)
-    try:
-        data_url = await page.evaluate(
-            """
-            () => {
-              const canvases = Array.from(document.querySelectorAll('canvas'));
-              const visible = canvases.filter(cv => {
-                const r = cv.getBoundingClientRect();
-                if (r.width < 120 || r.height < 120) return false;
-                const cs = getComputedStyle(cv);
-                if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') return false;
-                return r.left >= 0 && r.top >= 0 && r.right <= window.innerWidth + 20 && r.bottom <= window.innerHeight + 20;
-              });
-              if (!visible.length) return '';
-              visible.sort((a, b) => {
-                const ra = a.getBoundingClientRect();
-                const rb = b.getBoundingClientRect();
-                const sa = ra.width * ra.height;
-                const sb = rb.width * rb.height;
-                return sb - sa;
-              });
-              const target = visible[0];
-              try {
-                const data = target.toDataURL('image/png');
-                return typeof data === 'string' ? data : '';
-              } catch (e) {
-                return '';
-              }
-            }
-            """
-        )
-    except Exception:
-        return ""
-    return data_url if isinstance(data_url, str) else ""
-
-
 async def _fetch_item_detail_gallery(page: Page, item: Item) -> list[str]:
     """主路径：监听详情页 mtop/h5api 响应，从 JSON 的 imageInfos 取主图（与搜索同源逻辑）。
     若接口未命中再回退 DOM 点击轮播缩略图。"""
@@ -1177,8 +1128,10 @@ async def _fetch_item_detail_gallery(page: Page, item: Item) -> list[str]:
         return []
 
     captured: list[dict] = []
+    detail_validate_head = ""
 
     async def on_response(resp: Response) -> None:
+        nonlocal detail_validate_head
         if not _is_item_detail_mtop_url(resp.url):
             return
         try:
@@ -1203,6 +1156,12 @@ async def _fetch_item_detail_gallery(page: Page, item: Item) -> list[str]:
             return
         if not isinstance(data, dict):
             return
+        ret = data.get("ret") or []
+        head = ret[0] if isinstance(ret, list) and ret and isinstance(ret[0], str) else ""
+        if not detail_validate_head and any(
+            x in head for x in ("FAIL_SYS_USER_VALIDATE", "RGV587", "验证码", "滑动验证")
+        ):
+            detail_validate_head = head
         if not _mtop_payload_usable_quiet(data):
             return
         captured.append(data)
@@ -1242,7 +1201,6 @@ async def _fetch_item_detail_gallery(page: Page, item: Item) -> list[str]:
             if from_detail:
                 item.app_qr_payload = from_detail
                 break
-    item.app_qr_data_url = await _extract_official_app_qr_data_url(page)
 
     if api_urls:
         logger.info(
@@ -1267,6 +1225,10 @@ async def _fetch_item_detail_gallery(page: Page, item: Item) -> list[str]:
             click_urls,
         )
     else:
+        if detail_validate_head:
+            raise DetailValidationRequired(
+                f"商品 {item.item_id} 详情页触发风控验证：{detail_validate_head}"
+            )
         logger.info(
             "商品 {} 详情图 0 张（mtop 与 DOM 均无）",
             item.item_id,

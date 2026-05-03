@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import io
-import base64
 import smtplib
 import ssl
 import urllib.error
@@ -16,7 +15,6 @@ from email.mime.text import MIMEText
 from email.utils import formataddr, formatdate
 from html import escape
 from typing import Iterable
-from urllib.parse import quote
 
 from loguru import logger
 from PIL import Image, ImageDraw, ImageFont
@@ -77,29 +75,47 @@ class EmailNotifier:
         logger.success("邮件已发送给 {}：{}", self.mail_to, subject)
 
     def send_login_action_required(self, summary: str) -> None:
-        """登录态不可用时提醒用户执行 login（与商品推送邮件区分主题）。"""
+        """登录态不可用或风控验证触发时提醒用户人工处理。"""
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        subject = f"【{MAIL_SUBJECT_TAG}】需重新登录闲鱼 ({datetime.now():%Y-%m-%d %H:%M})"
+        need_validate = "验证" in summary or "FAIL_SYS_USER_VALIDATE" in summary or "风控" in summary
+        if need_validate:
+            subject = f"【{MAIL_SUBJECT_TAG}】需人工完成风控验证 ({datetime.now():%Y-%m-%d %H:%M})"
+        else:
+            subject = f"【{MAIL_SUBJECT_TAG}】需重新登录闲鱼 ({datetime.now():%Y-%m-%d %H:%M})"
+        intro = (
+            "闲鱼详情接口触发风控验证，本轮已暂停。\n\n"
+            if need_validate
+            else "闲鱼登录态不可用，本轮已跳过抓取。\n\n"
+        )
+        hint_prefix = "在浏览器中完成验证后，再执行：\n" if need_validate else "在浏览器中完成扫码登录后，再执行：\n"
+        pre_cmd = "  set HEADLESS=false\n  python main.py once\n\n" if need_validate else "  python main.py login\n\n"
         text_body = (
-            "闲鱼登录态不可用，本轮已跳过抓取。\n\n"
-            f"原因：{summary}\n\n"
-            "请在本机进入项目目录后执行：\n"
-            "  python main.py login\n\n"
-            "在浏览器中完成扫码登录后，再执行：\n"
-            "  python main.py once\n"
-            "或：\n"
-            "  python main.py run\n\n"
-            f"检测时间：{now}\n"
+            intro
+            + f"原因：{summary}\n\n"
+            + "请在本机进入项目目录后执行：\n"
+            + pre_cmd
+            + hint_prefix
+            + "  python main.py once\n"
+            + "或：\n"
+            + "  python main.py run\n\n"
+            + f"检测时间：{now}\n"
         )
         safe = escape(summary)
+        title = "需要人工完成风控验证" if need_validate else "需要重新登录闲鱼"
+        action_html = (
+            "<p>请在可视浏览器下执行 <code>HEADLESS=false python main.py once</code>，"
+            "完成页面验证后再继续运行监控。</p>"
+            if need_validate
+            else "<p>请在本机项目目录执行 <code>python main.py login</code> 完成扫码登录后，再运行 "
+            "<code>python main.py once</code> 或 <code>python main.py run</code>。</p>"
+        )
         html_body = (
             "<html><body style=\"font-family:sans-serif;line-height:1.6;padding:16px;\">"
-            "<h2 style=\"color:#c62828;\">需要重新登录闲鱼</h2>"
-            f"<p><b>原因：</b>{safe}</p>"
-            "<p>请在本机项目目录执行 <code>python main.py login</code> 完成扫码登录后，再运行 "
-            "<code>python main.py once</code> 或 <code>python main.py run</code>。</p>"
-            f"<p style=\"color:#666;font-size:12px;\">检测时间：{escape(now)}</p>"
-            "</body></html>"
+            + f"<h2 style=\"color:#c62828;\">{title}</h2>"
+            + f"<p><b>原因：</b>{safe}</p>"
+            + action_html
+            + f"<p style=\"color:#666;font-size:12px;\">检测时间：{escape(now)}</p>"
+            + "</body></html>"
         )
         self._send_raw(subject, text_body, html_body)
 
@@ -164,8 +180,6 @@ def _build_html_with_inline_images(
         location = escape(item.location or "")
         publish = escape(item.publish_text or "")
         seller = escape(item.seller or "")
-        mini_link = _mini_program_share_link(item)
-        mini_link_html = escape(mini_link)
         item_code_html = _item_code_html(item, idx, image_parts)
         gallery = _effective_gallery_urls(item)
         img_html = _gallery_cell_html(gallery, idx, image_parts)
@@ -184,10 +198,6 @@ def _build_html_with_inline_images(
                 </div>
                 <div style="font-size:12px;margin-top:6px;">
                   <a href="{url}" target="_blank" style="color:#1a73e8;">查看详情 -&gt;</a>
-                </div>
-                <div style="font-size:12px;margin-top:6px;line-height:1.5;word-break:break-all;">
-                  小程序分享链接：
-                  <a href="{mini_link_html}" target="_blank" rel="noopener" style="color:#1a73e8;text-decoration:underline;">{mini_link_html}</a>
                 </div>
                 <div style="margin-top:10px;">
                   {item_code_html}
@@ -243,7 +253,6 @@ def _build_text(keyword: str, items: Iterable[Item], omitted_extra: int = 0) -> 
             if extras:
                 lines.append(f"   {extras}")
         lines.append(f"   商品码：{(item.item_code or item.item_id).strip()}")
-        lines.append(f"   小程序分享链接：{_mini_program_share_link(item)}")
         lines.append(f"   链接：{item.normalized_detail_url()}")
         for j, img in enumerate(_effective_gallery_urls(item), 1):
             lines.append(f"   轮播图{j}：{img}")
@@ -363,11 +372,10 @@ def _item_code_html(item: Item, item_idx: int, image_parts: list[MIMEImage]) -> 
     payload = (item.app_qr_payload or "").strip()
     if not payload:
         payload = code or item.normalized_detail_url().strip()
-    official = _decode_data_url_png(item.app_qr_data_url or "")
-    if not payload and not official:
+    if not payload:
         return '<span style="font-size:12px;color:#999;">商品码二维码：无</span>'
     cid = f"idle-item-{item_idx}-code@local"
-    data = _render_item_code_qr_png_bytes(payload) or official
+    data = _render_item_code_qr_png_bytes(payload)
     if data:
         esc_payload = escape(payload)
         part = MIMEImage(data, _subtype="png")
@@ -422,39 +430,3 @@ def _render_item_code_qr_png_bytes(payload: str) -> bytes | None:
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=True)
     return buf.getvalue()
-
-
-def _mini_program_share_link(item: Item) -> str:
-    payload = (item.app_qr_payload or "").strip()
-    if payload.startswith("https://pages.goofish.com/sharexy"):
-        return payload
-    sid = (item.item_id or "").strip()
-    if sid.isdigit():
-        bfp = quote(f'{{"id":{sid}}}', safe="")
-        return (
-            "https://pages.goofish.com/sharexy"
-            "?loadingVisible=false"
-            "&bft=item"
-            "&bfs=idlepc.item"
-            "&spm=a21ybx.item.0.0"
-            f"&bfp={bfp}"
-            "&wechat_flag=1"
-        )
-    return payload or item.normalized_detail_url().strip()
-
-
-def _decode_data_url_png(data_url: str) -> bytes | None:
-    """解析 data:image/png;base64,... 为二进制。"""
-    raw = (data_url or "").strip()
-    if not raw or not raw.startswith("data:image"):
-        return None
-    parts = raw.split(",", 1)
-    if len(parts) != 2:
-        return None
-    head, payload = parts
-    if ";base64" not in head.lower():
-        return None
-    try:
-        return base64.b64decode(payload, validate=True)
-    except Exception:
-        return None
