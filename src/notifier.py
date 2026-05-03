@@ -16,6 +16,7 @@ from email.mime.text import MIMEText
 from email.utils import formataddr, formatdate
 from html import escape
 from typing import Iterable
+from urllib.parse import quote
 
 from loguru import logger
 from PIL import Image, ImageDraw, ImageFont
@@ -163,6 +164,8 @@ def _build_html_with_inline_images(
         location = escape(item.location or "")
         publish = escape(item.publish_text or "")
         seller = escape(item.seller or "")
+        mini_link = _mini_program_share_link(item)
+        mini_link_html = escape(mini_link)
         item_code_html = _item_code_html(item, idx, image_parts)
         gallery = _effective_gallery_urls(item)
         img_html = _gallery_cell_html(gallery, idx, image_parts)
@@ -181,6 +184,10 @@ def _build_html_with_inline_images(
                 </div>
                 <div style="font-size:12px;margin-top:6px;">
                   <a href="{url}" target="_blank" style="color:#1a73e8;">查看详情 -&gt;</a>
+                </div>
+                <div style="font-size:12px;margin-top:6px;line-height:1.5;word-break:break-all;">
+                  小程序分享链接：
+                  <a href="{mini_link_html}" target="_blank" rel="noopener" style="color:#1a73e8;text-decoration:underline;">{mini_link_html}</a>
                 </div>
                 <div style="margin-top:10px;">
                   {item_code_html}
@@ -236,6 +243,7 @@ def _build_text(keyword: str, items: Iterable[Item], omitted_extra: int = 0) -> 
             if extras:
                 lines.append(f"   {extras}")
         lines.append(f"   商品码：{(item.item_code or item.item_id).strip()}")
+        lines.append(f"   小程序分享链接：{_mini_program_share_link(item)}")
         lines.append(f"   链接：{item.normalized_detail_url()}")
         for j, img in enumerate(_effective_gallery_urls(item), 1):
             lines.append(f"   轮播图{j}：{img}")
@@ -414,6 +422,25 @@ def _render_item_code_qr_png_bytes(payload: str) -> bytes | None:
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=True)
     return buf.getvalue()
+
+
+def _mini_program_share_link(item: Item) -> str:
+    payload = (item.app_qr_payload or "").strip()
+    if payload.startswith("https://pages.goofish.com/sharexy"):
+        return payload
+    sid = (item.item_id or "").strip()
+    if sid.isdigit():
+        bfp = quote(f'{{"id":{sid}}}', safe="")
+        return (
+            "https://pages.goofish.com/sharexy"
+            "?loadingVisible=false"
+            "&bft=item"
+            "&bfs=idlepc.item"
+            "&spm=a21ybx.item.0.0"
+            f"&bfp={bfp}"
+            "&wechat_flag=1"
+        )
+    return payload or item.normalized_detail_url().strip()
 
 
 def _decode_data_url_png(data_url: str) -> bytes | None:
