@@ -1,0 +1,13 @@
+---
+description: 修改 .env.example 后同步 .env
+globs: "**/.env.example"
+alwaysApply: false
+---
+
+# 环境变量模板与本地 .env 同步
+
+- 每次**编辑或新增** [.env.example](.env.example) 中的配置项后，必须在同一轮任务内**同步更新**根目录的 `.env`（保留已有密钥与本地专有变量）。
+- 执行方式（任选其一，优先用脚本）：
+  - 运行：`python scripts/sync_env_from_example.py`
+  - 若已启用 Cursor 项目钩子：保存 `.env.example` 后会由 `afterFileEdit` 自动运行上述逻辑。
+- **禁止**用 `.env.example` 里的占位密码覆盖 `.env` 中用户已填好的 `SMTP_PASS` 等真实值；合并脚本会保留 `.env` 中已有键的整行内容，仅追加 example 里新增的键。
