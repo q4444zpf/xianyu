@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import io
+import base64
 import smtplib
 import ssl
 import urllib.error
@@ -16,6 +18,8 @@ from html import escape
 from typing import Iterable
 
 from loguru import logger
+from PIL import Image, ImageDraw, ImageFont
+import qrcode
 
 from .auth import DEFAULT_USER_AGENT
 from .crawler import _url_is_likely_idle_product_photo
@@ -159,6 +163,7 @@ def _build_html_with_inline_images(
         location = escape(item.location or "")
         publish = escape(item.publish_text or "")
         seller = escape(item.seller or "")
+        item_code_html = _item_code_html(item, idx, image_parts)
         gallery = _effective_gallery_urls(item)
         img_html = _gallery_cell_html(gallery, idx, image_parts)
         rows.append(
@@ -178,6 +183,9 @@ def _build_html_with_inline_images(
                   <a href="{url}" target="_blank" style="color:#1a73e8;">查看详情 -&gt;</a>
                 </div>
                 <div style="margin-top:10px;">
+                  {item_code_html}
+                </div>
+                <div style="margin-top:10px;">
                   {img_html}
                 </div>
               </td>
@@ -195,7 +203,7 @@ def _build_html_with_inline_images(
         )
     html = f"""
     <html>
-      <body style="font-family:-apple-system,Helvetica,Arial,'PingFang SC','Microsoft YaHei',sans-serif;background:#f6f7f9;padding:20px;">
+      <body style="font-family:-apple-system,Helvetica,Arial,'PingFang SC','Microsoft YaHei',sans-serif;background:#f6f7f9;padding:10px;">
         <div style="max-width:720px;margin:0 auto;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.06);">
           <div style="padding:16px 20px;background:#1a73e8;color:#fff;">
             <div style="font-size:18px;font-weight:bold;">闲鱼监控 · {escape(keyword)}</div>
@@ -227,6 +235,7 @@ def _build_text(keyword: str, items: Iterable[Item], omitted_extra: int = 0) -> 
             )
             if extras:
                 lines.append(f"   {extras}")
+        lines.append(f"   商品码：{(item.item_code or item.item_id).strip()}")
         lines.append(f"   链接：{item.normalized_detail_url()}")
         for j, img in enumerate(_effective_gallery_urls(item), 1):
             lines.append(f"   轮播图{j}：{img}")
@@ -309,7 +318,7 @@ def _gallery_cell_html(
 ) -> str:
     """主轮播多图内联；每张独立 CID。"""
     raw_size_style = (
-        "max-width:100%;width:auto;height:auto;display:block;border-radius:6px;"
+        "width:100%;max-width:100%;height:auto;display:block;border-radius:6px;"
         "border:1px solid #eee;margin-bottom:8px;"
     )
     if not urls:
@@ -339,3 +348,86 @@ def _gallery_cell_html(
                 "</div>"
             )
     return '<div style="display:block;">' + "".join(cells) + "</div>"
+
+
+def _item_code_html(item: Item, item_idx: int, image_parts: list[MIMEImage]) -> str:
+    code = (item.item_code or item.item_id).strip()
+    payload = (item.app_qr_payload or "").strip()
+    if not payload:
+        payload = code or item.normalized_detail_url().strip()
+    official = _decode_data_url_png(item.app_qr_data_url or "")
+    if not payload and not official:
+        return '<span style="font-size:12px;color:#999;">商品码二维码：无</span>'
+    cid = f"idle-item-{item_idx}-code@local"
+    data = _render_item_code_qr_png_bytes(payload) or official
+    if data:
+        esc_payload = escape(payload)
+        part = MIMEImage(data, _subtype="png")
+        part.add_header("Content-ID", f"<{cid}>")
+        part.add_header(
+            "Content-Disposition",
+            "inline",
+            filename=f"item-{item_idx}-qrcode.png",
+        )
+        image_parts.append(part)
+        return (
+            '<div style="font-size:12px;color:#444;margin-bottom:6px;">商品码二维码（闲鱼 App 扫码）</div>'
+            f'<img src="cid:{cid}" alt="商品码" '
+            'style="width:100%;max-width:220px;height:auto;display:block;border:1px solid #ddd;'
+            'border-radius:6px;background:#fff;">'
+            '<div style="margin-top:8px;font-size:12px;line-height:1.5;word-break:break-all;">'
+            f'<a href="{esc_payload}" target="_blank" rel="noopener" style="color:#1a73e8;text-decoration:underline;">{esc_payload}</a>'
+            "</div>"
+        )
+    return (
+        '<div style="font-size:12px;color:#444;">'
+        f"商品码：{escape(code)}"
+        "</div>"
+    )
+
+
+def _render_item_code_qr_png_bytes(payload: str) -> bytes | None:
+    """渲染商品码二维码 PNG，用于邮件内联显示。"""
+    clean = payload.strip()
+    if not clean:
+        return None
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=8,
+        border=3,
+    )
+    qr.add_data(clean)
+    qr.make(fit=True)
+    qr_img = qr.make_image(fill_color="black", back_color="white")
+    if not isinstance(qr_img, Image.Image):
+        qr_img = qr_img.convert("RGB")
+    else:
+        qr_img = qr_img.convert("RGB")
+    # 外层再加白边和浅灰边框，提升邮箱里扫码成功率。
+    padding = 16
+    w, h = qr_img.size
+    img = Image.new("RGB", (w + padding * 2, h + padding * 2), "white")
+    img.paste(qr_img, (padding, padding))
+    draw = ImageDraw.Draw(img)
+    draw.rectangle((0, 0, img.size[0] - 1, img.size[1] - 1), outline="#cccccc", width=1)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+def _decode_data_url_png(data_url: str) -> bytes | None:
+    """解析 data:image/png;base64,... 为二进制。"""
+    raw = (data_url or "").strip()
+    if not raw or not raw.startswith("data:image"):
+        return None
+    parts = raw.split(",", 1)
+    if len(parts) != 2:
+        return None
+    head, payload = parts
+    if ";base64" not in head.lower():
+        return None
+    try:
+        return base64.b64decode(payload, validate=True)
+    except Exception:
+        return None

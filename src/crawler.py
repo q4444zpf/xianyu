@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import re
 from dataclasses import dataclass
@@ -143,6 +144,24 @@ def _strip_alicdn_resize_suffix(url: str) -> str:
 
 
 _TPS_IN_URL = re.compile(r"-tps-(\d+)-(\d+)", re.I)
+_ITEM_CODE_RE = re.compile(r"商品码[:：\s]*([A-Za-z0-9-]{4,})", re.I)
+
+
+def _build_sharexy_qr_payload(item_id: str) -> str:
+    """按闲鱼 sharexy 规则拼装可扫码跳转商品详情的链接。"""
+    sid = (item_id or "").strip()
+    if not sid:
+        return ""
+    bfp = quote(f'{{"id":{sid}}}', safe="")
+    return (
+        "https://pages.goofish.com/sharexy"
+        "?loadingVisible=false"
+        "&bft=item"
+        "&bfs=idlepc.item"
+        "&spm=a21ybx.item.0.0"
+        f"&bfp={bfp}"
+        "&wechat_flag=1"
+    )
 
 
 def _url_is_likely_idle_product_photo(url: str) -> bool:
@@ -1023,6 +1042,132 @@ def _gallery_urls_from_detail_mtop_payloads(
     return [u for u in urls if _url_is_likely_idle_product_photo(u)]
 
 
+def _extract_item_code_from_payload(payload: object) -> str:
+    """从详情 JSON 里提取商品码文本，未找到返回空字符串。"""
+    found = ""
+
+    def visit(node: object, depth: int = 0) -> None:
+        nonlocal found
+        if found or depth > 14:
+            return
+        if isinstance(node, dict):
+            for k, v in node.items():
+                lk = str(k).lower()
+                if lk in ("itemcode", "item_code", "commoditycode", "commodity_code"):
+                    s = str(v).strip() if v is not None else ""
+                    if s:
+                        found = s
+                        return
+                if isinstance(v, str):
+                    m = _ITEM_CODE_RE.search(v)
+                    if m:
+                        found = m.group(1).strip()
+                        return
+                if isinstance(v, (dict, list)):
+                    visit(v, depth + 1)
+                    if found:
+                        return
+        elif isinstance(node, list):
+            for el in node:
+                visit(el, depth + 1)
+                if found:
+                    return
+
+    visit(payload)
+    return found
+
+
+def _extract_share_payload_from_detail_payload(payload: dict) -> str:
+    """从详情接口里提取分享 deeplink（优先官方字段）。"""
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return ""
+    item_do = data.get("itemDO")
+    if not isinstance(item_do, dict):
+        return ""
+    share_data = item_do.get("shareData")
+    if not isinstance(share_data, dict):
+        return ""
+    raw = share_data.get("shareInfoJsonString")
+    if not isinstance(raw, str) or not raw.strip():
+        return ""
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(obj, dict):
+        return ""
+    url = obj.get("url")
+    if isinstance(url, str):
+        return url.strip()
+    return ""
+
+
+async def _extract_item_code_from_page_dom(page: Page) -> str:
+    """从详情页可见文本提取“商品码: XXXXX”，用于 mtop 未命中时兜底。"""
+    try:
+        text = await page.evaluate("() => (document.body && document.body.innerText) || ''")
+    except Exception:
+        return ""
+    if not isinstance(text, str) or not text:
+        return ""
+    m = _ITEM_CODE_RE.search(text)
+    return m.group(1).strip() if m else ""
+
+
+async def _extract_official_app_qr_data_url(page: Page) -> str:
+    """点击详情页右侧 APP/商品码入口，提取官方扫码弹层里的二维码 data URL。"""
+    # 入口文案在不同页面/AB 实验里可能是 APP 或 商品码。
+    entry = page.get_by_text("APP", exact=True)
+    if await entry.count() == 0:
+        entry = page.get_by_text("商品码", exact=True)
+    if await entry.count() == 0:
+        return ""
+    try:
+        await entry.first.hover(timeout=3000)
+    except Exception:
+        pass
+    try:
+        await entry.first.click(timeout=3000)
+    except Exception:
+        # 有些页面仅 hover 出弹层，不要求 click 成功。
+        pass
+    await asyncio.sleep(0.9)
+    try:
+        data_url = await page.evaluate(
+            """
+            () => {
+              const canvases = Array.from(document.querySelectorAll('canvas'));
+              const visible = canvases.filter(cv => {
+                const r = cv.getBoundingClientRect();
+                if (r.width < 120 || r.height < 120) return false;
+                const cs = getComputedStyle(cv);
+                if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') return false;
+                return r.left >= 0 && r.top >= 0 && r.right <= window.innerWidth + 20 && r.bottom <= window.innerHeight + 20;
+              });
+              if (!visible.length) return '';
+              visible.sort((a, b) => {
+                const ra = a.getBoundingClientRect();
+                const rb = b.getBoundingClientRect();
+                const sa = ra.width * ra.height;
+                const sb = rb.width * rb.height;
+                return sb - sa;
+              });
+              const target = visible[0];
+              try {
+                const data = target.toDataURL('image/png');
+                return typeof data === 'string' ? data : '';
+              } catch (e) {
+                return '';
+              }
+            }
+            """
+        )
+    except Exception:
+        return ""
+    return data_url if isinstance(data_url, str) else ""
+
+
 async def _fetch_item_detail_gallery(page: Page, item: Item) -> list[str]:
     """主路径：监听详情页 mtop/h5api 响应，从 JSON 的 imageInfos 取主图（与搜索同源逻辑）。
     若接口未命中再回退 DOM 点击轮播缩略图。"""
@@ -1080,6 +1225,25 @@ async def _fetch_item_detail_gallery(page: Page, item: Item) -> list[str]:
             pass
 
     api_urls = _gallery_urls_from_detail_mtop_payloads(captured, item.item_id)
+    code_from_payload = ""
+    for payload in captured:
+        code_from_payload = _extract_item_code_from_payload(payload)
+        if code_from_payload:
+            break
+    if code_from_payload:
+        item.item_code = code_from_payload
+    else:
+        item.item_code = await _extract_item_code_from_page_dom(page)
+    # 优先用 sharexy（实测可被闲鱼 App 扫码直达）；详情接口 deeplink 仅作兜底。
+    item.app_qr_payload = _build_sharexy_qr_payload(item.item_id)
+    if not item.app_qr_payload:
+        for payload in captured:
+            from_detail = _extract_share_payload_from_detail_payload(payload)
+            if from_detail:
+                item.app_qr_payload = from_detail
+                break
+    item.app_qr_data_url = await _extract_official_app_qr_data_url(page)
+
     if api_urls:
         logger.info(
             "商品 {} 从详情 mtop 解析主图 {} 张: {}",
@@ -1119,6 +1283,8 @@ async def _enrich_items_cover_from_detail_pages(
         detail_page = await context.new_page()
         try:
             gallery = await _fetch_item_detail_gallery(detail_page, item)
+            if not item.item_code:
+                item.item_code = item.item_id
             if gallery:
                 item.gallery_urls = gallery
                 item.image_url = gallery[0]
