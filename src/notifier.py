@@ -21,7 +21,7 @@ from PIL import Image, ImageDraw, ImageFont
 import qrcode
 
 from .auth import DEFAULT_USER_AGENT
-from .crawler import _url_is_likely_idle_product_photo
+from .crawler import _build_sharexy_qr_payload, _url_is_likely_idle_product_photo
 from .models import Item
 
 # 邮件主题行前缀（显示在收件箱「主题」列）
@@ -243,6 +243,7 @@ def _build_html_with_inline_images(
 def _build_text(keyword: str, items: Iterable[Item], omitted_extra: int = 0) -> str:
     lines = [f"闲鱼监控 - 关键词：{keyword}", ""]
     for idx, item in enumerate(items, 1):
+        app_qr_payload = _app_qr_payload_for_item(item)
         lines.append(f"{idx}. {item.title}")
         if item.price:
             lines.append(f"   价格：{item.price}")
@@ -254,6 +255,8 @@ def _build_text(keyword: str, items: Iterable[Item], omitted_extra: int = 0) -> 
                 lines.append(f"   {extras}")
         lines.append(f"   商品码：{(item.item_code or item.item_id).strip()}")
         lines.append(f"   链接：{item.normalized_detail_url()}")
+        if app_qr_payload:
+            lines.append(f"   App扫码链接：{app_qr_payload}")
         for j, img in enumerate(_effective_gallery_urls(item), 1):
             lines.append(f"   轮播图{j}：{img}")
         lines.append("")
@@ -369,7 +372,7 @@ def _gallery_cell_html(
 
 def _item_code_html(item: Item, item_idx: int, image_parts: list[MIMEImage]) -> str:
     code = (item.item_code or item.item_id).strip()
-    payload = (item.app_qr_payload or "").strip()
+    payload = _app_qr_payload_for_item(item)
     if not payload:
         payload = code or item.normalized_detail_url().strip()
     if not payload:
@@ -399,7 +402,18 @@ def _item_code_html(item: Item, item_idx: int, image_parts: list[MIMEImage]) -> 
         '<div style="font-size:12px;color:#444;">'
         f"商品码：{escape(code)}"
         "</div>"
+        '<div style="margin-top:6px;font-size:12px;line-height:1.5;word-break:break-all;">'
+        f'<a href="{escape(payload)}" target="_blank" rel="noopener" style="color:#1a73e8;text-decoration:underline;">{escape(payload)}</a>'
+        "</div>"
     )
+
+
+def _app_qr_payload_for_item(item: Item) -> str:
+    """返回邮件里用于二维码和链接展示的 App 扫码 payload。"""
+    payload = (item.app_qr_payload or "").strip()
+    if payload:
+        return payload
+    return _build_sharexy_qr_payload(item.item_id)
 
 
 def _render_item_code_qr_png_bytes(payload: str) -> bytes | None:
