@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import re
 import sys
 import traceback
+from pathlib import Path
 
 from loguru import logger
 
@@ -60,8 +62,9 @@ async def _cmd_login() -> None:
 
 async def _notify_login_required_if_allowed(cfg: AppConfig, notifier: EmailNotifier, reason: str) -> None:
     """登录态不可用时发提醒邮件（受冷却时间限制）。"""
+    key_file = _reminder_file_for_reason(reason)
     if not should_send_login_reminder(
-        LAST_LOGIN_ALERT_PATH, cfg.login_reminder_cooldown_seconds
+        key_file, cfg.login_reminder_cooldown_seconds
     ):
         logger.info(
             "登录提醒邮件在冷却期内（{}s），本次不重复发送。",
@@ -70,10 +73,27 @@ async def _notify_login_required_if_allowed(cfg: AppConfig, notifier: EmailNotif
         return
     try:
         notifier.send_login_action_required(reason)
-        mark_login_reminder_sent(LAST_LOGIN_ALERT_PATH)
+        mark_login_reminder_sent(key_file)
         logger.warning("已发送登录提醒邮件：{}", reason[:120])
     except Exception as exc:
         logger.error("发送登录提醒邮件失败：{}\n{}", exc, traceback.format_exc())
+
+
+def _reminder_file_for_reason(reason: str) -> Path:
+    """按提醒类别隔离冷却文件，避免风控提醒被登录提醒误抑制。"""
+    if any(k in reason for k in ("FAIL_SYS_USER_VALIDATE", "风控", "验证")):
+        return LAST_LOGIN_ALERT_PATH.with_name(
+            f"{LAST_LOGIN_ALERT_PATH.stem}_validate{LAST_LOGIN_ALERT_PATH.suffix}"
+        )
+    return LAST_LOGIN_ALERT_PATH
+
+
+def _extract_blocked_item_id(reason: str) -> str | None:
+    """从风控异常文案中提取商品 id，便于优先打开被拦截的详情页。"""
+    if not reason:
+        return None
+    m = re.search(r"\b(\d{10,})\b", reason)
+    return m.group(1) if m else None
 
 
 async def _run_one_cycle(cfg: AppConfig, store: SeenItemStore, notifier: EmailNotifier) -> None:
@@ -144,13 +164,35 @@ async def _run_one_cycle(cfg: AppConfig, store: SeenItemStore, notifier: EmailNo
         except DetailValidationRequired as exc:
             msg = (
                 f"{exc}\n"
-                "请以可视浏览器运行并手动完成验证后重试：\n"
-                "1) 设置 HEADLESS=false\n"
+                "请改为可视浏览器并手动完成验证后重试：\n"
+                "1) 将 .env 中 HEADLESS 设为 false\n"
                 "2) 执行 python main.py once"
             )
             logger.warning(msg)
             await _notify_login_required_if_allowed(cfg, notifier, msg)
-            return
+            if cfg.headless:
+                return
+
+            blocked_item_id = _extract_blocked_item_id(str(exc))
+            logger.info("当前为可视模式，尝试等待人工验证后在本轮继续发送。")
+            try:
+                recovered = await crawler.interactive_validate_and_enrich(
+                    to_mail,
+                    blocked_item_id=blocked_item_id,
+                )
+            except Exception as recover_exc:
+                logger.warning(
+                    "人工验证续跑流程失败，本轮结束：{}\n{}",
+                    recover_exc,
+                    traceback.format_exc(),
+                )
+                return
+
+            if not recovered:
+                logger.warning("人工验证后仍无法通过风控，本轮结束，等待下次任务。")
+                return
+
+            logger.info("人工验证通过，已完成详情补图，继续发送邮件。")
         except Exception as exc:
             logger.warning(
                 "发信前详情主图拉取失败，邮件中将使用搜索列表中的图片链接: {}",

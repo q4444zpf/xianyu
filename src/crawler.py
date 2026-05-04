@@ -8,7 +8,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import re
 from dataclasses import dataclass
@@ -1328,6 +1327,67 @@ class XianyuCrawler:
             try:
                 await _enrich_items_cover_from_detail_pages(context, items)
             finally:
+                await context.close()
+                await browser.close()
+
+    async def interactive_validate_and_enrich(
+        self,
+        items: list[Item],
+        *,
+        blocked_item_id: str | None = None,
+    ) -> bool:
+        """打开可视浏览器等待人工完成验证，随后在同一上下文内重试详情补图。"""
+        if not items:
+            return False
+        target = next((it for it in items if it.item_id == blocked_item_id), items[0])
+        detail = target.normalized_detail_url()
+        if not detail:
+            return False
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=False,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                ],
+            )
+            context = await browser.new_context(
+                storage_state=str(self.storage_state_path)
+                if self.storage_state_path.exists()
+                else None,
+                user_agent=DEFAULT_USER_AGENT,
+                viewport={"width": 1920, "height": 1080},
+                locale="zh-CN",
+            )
+            if _StealthCls is not None:
+                try:
+                    await _StealthCls().apply_stealth_async(context)
+                except Exception as exc:  # pragma: no cover
+                    logger.debug("stealth 应用失败: {}", exc)
+            page = await context.new_page()
+            try:
+                try:
+                    await page.goto(detail, wait_until="domcontentloaded", timeout=35000)
+                except PWTimeoutError:
+                    logger.debug("可视验证页加载超时: {}", target.item_id)
+                logger.warning(
+                    "已打开可视浏览器详情页。请手动完成验证后，回到终端按回车继续本轮发送。"
+                )
+                try:
+                    await asyncio.to_thread(input, "完成验证后按回车继续 > ")
+                except EOFError:
+                    logger.warning("当前终端不可交互，无法等待人工回车确认。")
+                    return False
+
+                try:
+                    await _enrich_items_cover_from_detail_pages(context, items)
+                    return True
+                except DetailValidationRequired as exc:
+                    logger.warning("人工验证后仍触发风控：{}", exc)
+                    return False
+            finally:
+                await page.close()
                 await context.close()
                 await browser.close()
 
